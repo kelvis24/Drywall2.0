@@ -157,6 +157,7 @@ class SimplifiedDualCapture:
         self.frame_sync_dict = {}  # Store frames waiting for sync
         self.sync_lock = threading.Lock()
         self.frame_counter = 0
+        self.master_frame_counter = 0  # Global frame counter for all cameras
         
         # Motion detection to save only interesting frames
         self.previous_frames = {}  # Store previous frame for each camera
@@ -181,9 +182,10 @@ class SimplifiedDualCapture:
             'last_capture_counts': {},
         }
 
-        print("🚀 SIMPLIFIED DUAL HIGH-SPEED CAPTURE SYSTEM")
+        print("🚀 FLIR-OPTIMIZED DUAL HIGH-SPEED CAPTURE SYSTEM")
         print("=" * 50)
-        print("📸 Synchronized dual camera capture")
+        print("📸 FLIR-synchronized dual camera capture")
+        print("🔄 Using FLIR best practice: Inner loop camera iteration")
         print(f"🔗 GPIO Hardware Sync: {'ENABLED' if enable_gpio_sync else 'DISABLED'}")
         if enable_gpio_sync:
             print("   Primary camera will trigger secondary camera via GPIO")
@@ -814,6 +816,8 @@ class SimplifiedDualCapture:
             print("      Primary Pin 5 (blue) → Secondary Pin 6 (brown)") 
             print("      Primary Pin 6 (brown) → Secondary Pin 6 (brown)")
             print("      10kΩ resistor: Primary Pin 3 (red) → Primary Pin 4 (white)")
+            print("   ⚠️  IMPORTANT: If ball appears at different speeds in each camera,")
+            print("      check physical GPIO wiring and ensure cameras are hardware-synced!")
             
             # Verify trigger mode is still enabled
             trigger_mode_verify = PySpin.CEnumerationPtr(secondary_nodemap.GetNode("TriggerMode"))
@@ -1025,132 +1029,196 @@ class SimplifiedDualCapture:
             print(f'❌ Error enumerating cameras: {ex}')
             return False
 
-    def capture_thread(self, camera_info):
-        """Capture frames from individual camera"""
-        cam = camera_info['camera']
-        camera_id = camera_info['camera_id']
-        frame_count = 0
+    def start_capture(self):
+        if not self.cameras:
+            print('❌ No cameras available!')
+            return False
+
+        self.running = True
+        
+        # Start acquisition on all cameras first (FLIR best practice)
+        for camera_info in self.cameras:
+            try:
+                cam = camera_info['camera']
+                cam.BeginAcquisition()
+                print(f'🚀 Started acquisition for camera {camera_info["camera_id"]}')
+            except PySpin.SpinnakerException as ex:
+                print(f'❌ Error starting acquisition for camera {camera_info["camera_id"]}: {ex}')
+                return False
+
+        # Start display threads if display is enabled
+        if self.enable_display:
+            for camera_info in self.cameras:
+                camera_id = camera_info['camera_id']
+                thread = threading.Thread(target=self.display_thread, args=(camera_id,))
+                thread.daemon = True
+                thread.start()
+                self.display_threads.append(thread)
+
+        # Start synchronized capture thread (FLIR approach)
+        capture_thread = threading.Thread(target=self.synchronized_capture_loop)
+        capture_thread.daemon = True
+        capture_thread.start()
+        self.capture_threads.append(capture_thread)
+
+        print('\n🚀 FLIR-SYNCHRONIZED DUAL CAPTURE ACTIVE')
+        if self.enable_display:
+            print('🎮 Press "q" or ESC in any window to exit')
+        else:
+            print('🎮 Press Ctrl+C to exit')
 
         try:
-            cam.BeginAcquisition()
-            print(f'🚀 Started capture for camera {camera_id} - targeting 350 FPS')
-
             while self.running:
-                try:
-                    image_result = cam.GetNextImage(50)  # 50ms timeout
-                    if not image_result.IsIncomplete():
-                        frame_count += 1
-                        self.stats['frames_captured'][camera_id] += 1
-                        
-                        # Get image data
-                        image_data = image_result.GetNDArray()
-                        timestamp = datetime.now()
-                        
-                        # Check for motion before saving
-                        has_motion = self.detect_motion(camera_id, image_data)
-                        
-                        if has_motion:
-                            # Motion detected on this camera - try to synchronize with other camera
-                            self.try_synchronize_frame(camera_id, image_data, frame_count, timestamp, has_motion=True)
-                        else:
-                            # No motion on this camera, but still check if other camera had recent motion
-                            # This allows sync when only one camera detects motion but both cameras see the ball
-                            self.try_synchronize_frame(camera_id, image_data, frame_count, timestamp, has_motion=False)
-                            self.stats['frames_skipped'][camera_id] += 1
-                        
-                        # Send frame to display queue if display is enabled
-                        if self.enable_display and camera_id in self.display_queues:
-                            if not self.display_queues[camera_id].full():
-                                # Convert to BGR for display
-                                if len(image_data.shape) == 2:
-                                    display_frame = cv2.cvtColor(image_data, cv2.COLOR_GRAY2BGR)
-                                else:
-                                    display_frame = image_data.copy()
-                                
-                                # Add labels to display frame
-                                height, width = display_frame.shape[:2]
-                                cv2.putText(display_frame, f'Camera {camera_id} - LIVE', 
-                                           (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                                cv2.putText(display_frame, f'Frame: {frame_count}', 
-                                           (width - 120, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                                cv2.putText(display_frame, timestamp.strftime("%H:%M:%S.%f")[:-3], 
-                                           (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                                
-                                try:
-                                    self.display_queues[camera_id].put_nowait(display_frame)
-                                except:
-                                    pass  # Skip if queue full
+                time.sleep(1)  # Update every 1 second for more frequent FPS updates
+                self.print_fps_stats()
+        except KeyboardInterrupt:
+            print('\n🛑 Stopping capture system...')
+            self.stop()
 
-                    image_result.Release()
+        return True
 
-                except PySpin.SpinnakerException as ex:
-                    if self.running and "timeout" not in str(ex).lower():
-                        print(f'❌ Capture error for camera {camera_id}: {ex}')
-                    continue
-
-            cam.EndAcquisition()
-            print(f'🛑 Stopped capture for camera {camera_id}')
-
-        except PySpin.SpinnakerException as ex:
-            print(f'❌ Error in capture thread for camera {camera_id}: {ex}')
-
-    def try_synchronize_frame(self, camera_id, frame_data, frame_count, timestamp, has_motion=False):
-        """Try to synchronize frames from multiple cameras using timestamp-based matching"""
-        with self.sync_lock:
-            # Use timestamp (rounded to milliseconds) as sync key for better matching
-            timestamp_ms = int(timestamp.timestamp() * 1000)  # Convert to milliseconds
-            
-            # Store this frame with timestamp info
-            frame_info = {
-                'frame_data': frame_data.copy(),
-                'timestamp': timestamp,
-                'frame_count': frame_count,
-                'timestamp_ms': timestamp_ms,
-                'has_motion': has_motion
-            }
-            
-            # Save individual frame only if enabled and to separate folder
-            if self.save_individual_frames and has_motion:
-                self.save_individual_frame(camera_id, frame_info)
-            
-            # Try to find a matching frame from other camera(s) within 50ms window (increased for better sync)
-            sync_tolerance_ms = 10  # Increased tolerance for better synchronization
-            
-            # Look for frames from other cameras within the time window
-            matching_frames = {camera_id: frame_info}
-            
-            # Check existing frames for potential matches
-            for stored_timestamp_ms, stored_frames in list(self.frame_sync_dict.items()):
-                time_diff = abs(timestamp_ms - stored_timestamp_ms)
-                if time_diff <= sync_tolerance_ms:
-                    # Found frames within sync window
-                    for other_camera_id, other_frame_info in stored_frames.items():
-                        if other_camera_id != camera_id:
-                            matching_frames[other_camera_id] = other_frame_info
+    def synchronized_capture_loop(self):
+        """
+        FLIR-recommended synchronized capture approach:
+        Inner loop iterates through cameras for each frame set
+        """
+        frame_set_count = 0
+        camera_frame_counts = {info['camera_id']: 0 for info in self.cameras}
+        
+        print(f'📸 Starting FLIR-synchronized capture loop with {len(self.cameras)} cameras')
+        
+        try:
+            while self.running:
+                # Capture one frame from each camera in sequence (FLIR method)
+                # This ensures frames are captured as close together as possible
+                synchronized_frames = {}
+                capture_timestamp = datetime.now()
+                all_frames_captured = True
+                
+                # Inner loop iterates through cameras (FLIR best practice)
+                for camera_info in self.cameras:
+                    camera_id = camera_info['camera_id']
+                    cam = camera_info['camera']
                     
-                    # If we have frames from all cameras, check if any had motion
-                    if len(matching_frames) == len(self.cameras):
-                        # Check if any of the frames had motion detected
-                        motion_detected = any(frame['has_motion'] for frame in matching_frames.values())
+                    try:
+                        # Get next image with short timeout for responsiveness
+                        image_result = cam.GetNextImage(100)  # 100ms timeout
                         
-                        if motion_detected:
-                            self.save_synchronized_frames(matching_frames, f"sync_{timestamp_ms}")
-                            print(f"✅ SYNC SAVED! Cameras matched within {time_diff}ms - motion detected")
-                            # Remove the matched frames
-                            if stored_timestamp_ms in self.frame_sync_dict:
-                                del self.frame_sync_dict[stored_timestamp_ms]
-                            return
+                        if not image_result.IsIncomplete():
+                            # Get image data
+                            image_data = image_result.GetNDArray()
+                            camera_frame_counts[camera_id] += 1
+                            self.stats['frames_captured'][camera_id] += 1
+                            
+                            # Store frame for synchronization
+                            synchronized_frames[camera_id] = {
+                                'frame_data': image_data.copy(),
+                                'timestamp': capture_timestamp,
+                                'frame_count': camera_frame_counts[camera_id],
+                                'camera_id': camera_id
+                            }
+                            
+                            # Send frame to display queue if display is enabled
+                            if self.enable_display and camera_id in self.display_queues:
+                                if not self.display_queues[camera_id].full():
+                                    # Convert to BGR for display
+                                    if len(image_data.shape) == 2:
+                                        display_frame = cv2.cvtColor(image_data, cv2.COLOR_GRAY2BGR)
+                                    else:
+                                        display_frame = image_data.copy()
+                                    
+                                    # Add labels to display frame
+                                    height, width = display_frame.shape[:2]
+                                    cv2.putText(display_frame, f'Camera {camera_id} - SYNC', 
+                                               (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                    cv2.putText(display_frame, f'Set: {frame_set_count}', 
+                                               (width - 120, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                                    cv2.putText(display_frame, capture_timestamp.strftime("%H:%M:%S.%f")[:-3], 
+                                               (10, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                                    
+                                    try:
+                                        self.display_queues[camera_id].put_nowait(display_frame)
+                                    except:
+                                        pass  # Skip if queue full
+                        else:
+                            print(f'⚠️ Incomplete image from camera {camera_id}: {image_result.GetImageStatus()}')
+                            all_frames_captured = False
+                        
+                        image_result.Release()
+                        
+                    except PySpin.SpinnakerException as ex:
+                        if self.running and "timeout" not in str(ex).lower():
+                            print(f'❌ Capture error for camera {camera_id}: {ex}')
+                        all_frames_captured = False
+                        continue
+                
+                # Process the synchronized frame set if we got frames from all cameras
+                if all_frames_captured and len(synchronized_frames) == len(self.cameras):
+                    self.process_synchronized_frame_set(synchronized_frames, frame_set_count)
+                    frame_set_count += 1
+                elif len(synchronized_frames) > 0:
+                    # Still process partial sets, but mark them as such
+                    print(f'⚠️ Partial frame set: {len(synchronized_frames)}/{len(self.cameras)} cameras')
+                    self.process_synchronized_frame_set(synchronized_frames, frame_set_count, partial=True)
+                    frame_set_count += 1
+                    
+        except Exception as ex:
+            print(f'❌ Error in synchronized capture loop: {ex}')
+            traceback.print_exc()
+        finally:
+            # End acquisition on all cameras
+            for camera_info in self.cameras:
+                try:
+                    cam = camera_info['camera']
+                    if cam.IsStreaming():
+                        cam.EndAcquisition()
+                    print(f'🛑 Stopped acquisition for camera {camera_info["camera_id"]}')
+                except:
+                    pass
+
+    def process_synchronized_frame_set(self, synchronized_frames, frame_set_count, partial=False):
+        """
+        Process a set of synchronized frames from all cameras
+        """
+        try:
+            # Check for motion in any camera
+            motion_detected = False
+            motion_cameras = []
             
-            # Store this frame for future matching (always store, regardless of motion)
-            if timestamp_ms not in self.frame_sync_dict:
-                self.frame_sync_dict[timestamp_ms] = {}
-            self.frame_sync_dict[timestamp_ms][camera_id] = frame_info
+            for camera_id, frame_info in synchronized_frames.items():
+                has_motion = self.detect_motion(camera_id, frame_info['frame_data'])
+                frame_info['has_motion'] = has_motion
+                
+                if has_motion:
+                    motion_detected = True
+                    motion_cameras.append(camera_id)
+                else:
+                    self.stats['frames_skipped'][camera_id] += 1
             
-            # Clean up old frames (keep only recent 200ms worth - increased for better sync)
-            current_time_ms = int(time.time() * 1000)
-            keys_to_remove = [k for k in self.frame_sync_dict.keys() if current_time_ms - k > 200]
-            for k in keys_to_remove:
-                del self.frame_sync_dict[k]
+            # Only save if motion detected or if we want to save everything
+            if motion_detected or not self.enable_motion_detection:
+                # Save individual frames if enabled
+                if self.save_individual_frames:
+                    for camera_id, frame_info in synchronized_frames.items():
+                        if frame_info.get('has_motion', False) or not self.enable_motion_detection:
+                            self.save_individual_frame(camera_id, frame_info)
+                
+                # Always save synchronized frames when motion is detected
+                sync_key = f"flir_sync_{frame_set_count:06d}"
+                if partial:
+                    sync_key += "_partial"
+                    
+                self.save_synchronized_frames(synchronized_frames, sync_key)
+                
+                if motion_detected:
+                    motion_info = ", ".join([f"Cam{cid}" for cid in motion_cameras])
+                    print(f"🔄 FLIR-SYNC #{frame_set_count}: Motion on {motion_info} - Frame set saved!")
+                else:
+                    print(f"🔄 FLIR-SYNC #{frame_set_count}: No motion filter - Frame set saved!")
+            
+        except Exception as ex:
+            print(f'❌ Error processing synchronized frame set: {ex}')
+            traceback.print_exc()
 
     def save_individual_frame(self, camera_id, frame_info):
         """Save individual frame from one camera"""
@@ -1322,53 +1390,15 @@ class SimplifiedDualCapture:
         except Exception as ex:
             print(f'❌ Error writing synchronized image: {ex}')
 
-    def start_capture(self):
-        if not self.cameras:
-            print('❌ No cameras available!')
-            return False
-
-        self.running = True
-        
-        # Start capture threads
-        for camera_info in self.cameras:
-            thread = threading.Thread(target=self.capture_thread, args=(camera_info,))
-            thread.daemon = True
-            thread.start()
-            self.capture_threads.append(thread)
-
-        # Start display threads if display is enabled
-        if self.enable_display:
-            for camera_info in self.cameras:
-                camera_id = camera_info['camera_id']
-                thread = threading.Thread(target=self.display_thread, args=(camera_id,))
-                thread.daemon = True
-                thread.start()
-                self.display_threads.append(thread)
-
-        print('\n🚀 SYNCHRONIZED DUAL CAPTURE ACTIVE')
-        if self.enable_display:
-            print('🎮 Press "q" or ESC in any window to exit')
-        else:
-            print('🎮 Press Ctrl+C to exit')
-
-        try:
-            while self.running:
-                time.sleep(1)  # Update every 1 second for more frequent FPS updates
-                self.print_fps_stats()
-        except KeyboardInterrupt:
-            print('\n🛑 Stopping capture system...')
-            self.stop()
-
-        return True
-
     def print_fps_stats(self):
         """Print current FPS statistics - simplified and focused on FPS"""
         current_time = time.time()
         runtime = current_time - self.stats['start_time']
         time_interval = current_time - self.stats['last_fps_time']
         
-        # Calculate FPS for each camera
+        # Calculate FPS for each camera and check for sync issues
         fps_summary = []
+        camera_fps = {}
         for camera_id in self.stats['frames_captured']:
             captured = self.stats['frames_captured'][camera_id]
             last_count = self.stats['last_capture_counts'][camera_id]
@@ -1376,11 +1406,20 @@ class SimplifiedDualCapture:
             avg_fps = captured / runtime if runtime > 0 else 0
             recent_frames = captured - last_count
             realtime_fps = recent_frames / time_interval if time_interval > 0 else 0
+            camera_fps[camera_id] = realtime_fps
             
             fps_summary.append(f"Cam{camera_id}: {realtime_fps:.1f}FPS (avg {avg_fps:.1f})")
             
             # Update last count
             self.stats['last_capture_counts'][camera_id] = captured
+        
+        # Check for sync issues (FPS differences)
+        sync_warning = ""
+        if len(camera_fps) == 2:
+            fps_values = list(camera_fps.values())
+            fps_diff = abs(fps_values[0] - fps_values[1])
+            if fps_diff > 5:  # More than 5 FPS difference indicates sync problems
+                sync_warning = f" ⚠️ SYNC ISSUE! FPS diff: {fps_diff:.1f}"
         
         # Show concise FPS info with motion detection stats
         fps_line = " | ".join(fps_summary)
@@ -1388,7 +1427,7 @@ class SimplifiedDualCapture:
         total_skipped = sum(self.stats['frames_skipped'].values())
         sync_count = self.stats["synchronized_frames_saved"]
         
-        print(f"🚀 FPS: {fps_line} | 💾 Saved: {total_individual} individual + {sync_count} sync | "
+        print(f"🚀 FPS: {fps_line}{sync_warning} | 💾 Saved: {total_individual} individual + {sync_count} sync | "
               f"⏭️ Skipped: {total_skipped} (no motion) | ⏱️ {runtime:.0f}s")
         
         self.stats['last_fps_time'] = current_time
@@ -1410,7 +1449,7 @@ class SimplifiedDualCapture:
         display_width = int(display_height * aspect_ratio)
         cv2.resizeWindow(window_name, display_width, display_height)
         
-        print(f'📺 Started live display for camera {camera_id} - 350 FPS capture mode')
+        print(f'📺 Started live display for camera {camera_id} - FLIR synchronized mode')
 
         while self.running:
             try:
